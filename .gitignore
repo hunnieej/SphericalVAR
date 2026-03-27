@@ -1,0 +1,7 @@
+.ruff_cache/
+__pycache__/
+data/
+eval_outputs/
+pretrained/
+probe_outputs/
+tmp_*.jpg
