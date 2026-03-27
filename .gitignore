@@ -5,3 +5,4 @@ eval_outputs/
 pretrained/
 probe_outputs/
 tmp_*.jpg
+prone_outputs/

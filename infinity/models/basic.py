@@ -171,6 +171,7 @@ def apply_rotary_emb(
     pad_to_multiplier,
     rope2d_normalized_by_hw,
     scale_ind,
+    group_idx: Optional[int] = None,
 ):
     qk = torch.stack((q, k), dim=0)  # (2, batch_size, heads, seq_len, head_dim)
     device_type = qk.device.type
@@ -185,13 +186,23 @@ def apply_rotary_emb(
             start = np.sum(
                 [item[0] * item[1] * item[2] for item in scale_schedule[:scale_ind]]
             )
-        rope2d_freqs_grid[str(tuple(scale_schedule))] = rope2d_freqs_grid[
-            str(tuple(scale_schedule))
-        ].to(qk.device)
-        assert start + seq_len <= rope2d_freqs_grid[str(tuple(scale_schedule))].shape[4]
-        rope_cache = rope2d_freqs_grid[str(tuple(scale_schedule))][
-            :, :, :, :, start : start + seq_len
-        ]  # rope_cache shape: [2, 1, 1, 1, seq_len, half_head_dim]
+        cache_key = str(tuple(scale_schedule))
+        rope_cache_full = rope2d_freqs_grid[cache_key].to(qk.device)
+        if rope_cache_full.dim() == 6:
+            rope_cache = rope_cache_full
+            if group_idx not in (None, 0):
+                raise ValueError(
+                    "group_idx specified but rope cache has no group dimension"
+                )
+        else:
+            assert rope_cache_full.dim() == 7, (
+                f"Unexpected rope cache ndim={rope_cache_full.dim()}"
+            )
+            if group_idx is None:
+                raise ValueError("group_idx must be provided for grouped rope cache")
+            rope_cache = rope_cache_full[group_idx]
+        assert start + seq_len <= rope_cache.shape[4]
+        rope_cache = rope_cache[:, :, :, :, start : start + seq_len]
         qk = qk.reshape(
             *qk.shape[:-1], -1, 2
         )  # (2, batch_size, heads, seq_len, half_head_dim, 2)
@@ -357,11 +368,69 @@ class SelfAttention(nn.Module):
         self.pad_to_multiplier = pad_to_multiplier
 
         self.rope2d_normalized_by_hw = rope2d_normalized_by_hw
+        self.rope_head_group_sizes: Optional[Tuple[int, ...]] = None
 
     def kv_caching(self, enable: bool):  # kv caching: only used during inference
         self.caching = enable
         self.cached_k = None
         self.cached_v = None
+
+    def _apply_rope(
+        self,
+        q,
+        k,
+        scale_schedule,
+        rope2d_freqs_grid,
+        scale_ind,
+    ):
+        if self.using_flash:
+            q_bhl = q.transpose(1, 2)
+            k_bhl = k.transpose(1, 2)
+        else:
+            q_bhl, k_bhl = q, k
+
+        if self.rope_head_group_sizes:
+            q_split = torch.split(q_bhl, self.rope_head_group_sizes, dim=1)
+            k_split = torch.split(k_bhl, self.rope_head_group_sizes, dim=1)
+            q_rot, k_rot = [], []
+            for gi, (qg, kg) in enumerate(zip(q_split, k_split)):
+                qg_rot, kg_rot = apply_rotary_emb(
+                    qg,
+                    kg,
+                    scale_schedule,
+                    rope2d_freqs_grid,
+                    self.pad_to_multiplier,
+                    self.rope2d_normalized_by_hw,
+                    scale_ind,
+                    group_idx=gi,
+                )
+                q_rot.append(qg_rot)
+                k_rot.append(kg_rot)
+            q_bhl = torch.cat(q_rot, dim=1)
+            k_bhl = torch.cat(k_rot, dim=1)
+        else:
+            q_bhl, k_bhl = apply_rotary_emb(
+                q_bhl,
+                k_bhl,
+                scale_schedule,
+                rope2d_freqs_grid,
+                self.pad_to_multiplier,
+                self.rope2d_normalized_by_hw,
+                scale_ind,
+            )
+
+        if self.using_flash:
+            return q_bhl.transpose(1, 2), k_bhl.transpose(1, 2)
+        return q_bhl, k_bhl
+
+    def set_rope_head_group_sizes(self, sizes: Optional[Tuple[int, ...]]):
+        if sizes is None:
+            self.rope_head_group_sizes = None
+            return
+        assert sum(sizes) == self.num_heads, (
+            f"Invalid rope head group sizes {sizes} for num_heads={self.num_heads}"
+        )
+        self.rope_head_group_sizes = tuple(sizes)
 
     # NOTE: attn_bias_or_two_vector is None during inference
     def forward(
@@ -427,15 +496,13 @@ class SelfAttention(nn.Module):
             k = k.contiguous()  # bf16
             v = v.contiguous()  # bf16
         if rope2d_freqs_grid is not None:
-            q, k = apply_rotary_emb(
+            q, k = self._apply_rope(
                 q,
                 k,
                 scale_schedule,
                 rope2d_freqs_grid,
-                self.pad_to_multiplier,
-                self.rope2d_normalized_by_hw,
                 scale_ind,
-            )  # , freqs_cis=freqs_cis)
+            )
         if self.caching:  # kv caching: only used during inference
             if self.cached_k is None:
                 self.cached_k = k
@@ -727,6 +794,9 @@ class SelfAttnBlock(nn.Module):
                 self.attn(
                     self.ln_wo_grad(x.float()).mul(scale1.add(1)).add_(shift1),
                     attn_bias_or_two_vector=attn_bias_or_two_vector,
+                    scale_schedule=scale_schedule,
+                    rope2d_freqs_grid=rope2d_freqs_grid,
+                    scale_ind=scale_ind,
                 ).mul_(gamma1)
             )
             x = x + self.drop_path(
@@ -741,6 +811,9 @@ class SelfAttnBlock(nn.Module):
                         C=self.C, eps=self.norm_eps, x=x, scale=scale1, shift=shift1
                     ),
                     attn_bias_or_two_vector=attn_bias_or_two_vector,
+                    scale_schedule=scale_schedule,
+                    rope2d_freqs_grid=rope2d_freqs_grid,
+                    scale_ind=scale_ind,
                 ).mul_(gamma1)
             )
             x = x + self.drop_path(
@@ -884,6 +957,7 @@ class CrossAttnBlock(nn.Module):
                     attn_fn,
                     scale_schedule,
                     rope2d_freqs_grid,
+                    scale_ind=scale_ind,
                 )
             x = x + self.drop_path(x_sa.mul_(gamma1))
             x = x + self.ca(self.ca_norm(x), ca_kv).float().mul_(self.ca_gamma)

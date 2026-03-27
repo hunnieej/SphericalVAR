@@ -4,7 +4,7 @@ Improved Spherical RoPE for Infinity (v2)
 핵심 개선:
 1. Scale-aware alpha: coarse scale은 표준 유지, fine scale만 spherical 보정
    → KV cache accumulation 시 frequency 연속성 보장
-   
+
 2. Mode 2 (star-style) base: upw 기준 global freq
    → 모든 scale에서 seam 조건 일관성 유지
 
@@ -34,6 +34,21 @@ import torch.nn.functional as F
 from infinity.utils.dynamic_resolution import dynamic_resolution_h_w as _DYN_RES
 
 
+def _blend_freq_with_band(
+    inv_freq: torch.Tensor, spherical_freq: torch.Tensor, ratio: float
+) -> torch.Tensor:
+    if ratio >= 1.0:
+        return spherical_freq
+    if ratio <= 0.0:
+        return inv_freq
+    qtr_dim = inv_freq.shape[0]
+    band_len = max(1, int(round(qtr_dim * ratio)))
+    band_start = max(0, qtr_dim - band_len)
+    idx = torch.arange(qtr_dim, device=inv_freq.device)
+    mask = (idx >= band_start).to(inv_freq.dtype)
+    return mask * spherical_freq + (1.0 - mask) * inv_freq
+
+
 def _compute_sph_freq_w_adaptive(
     inv_freq: torch.Tensor,
     pw: int,
@@ -41,6 +56,7 @@ def _compute_sph_freq_w_adaptive(
     scale_idx: int,
     num_scales: int,
     alpha_schedule: str = "linear",
+    band_ratio: float = 1.0,
 ) -> torch.Tensor:
     """
     Scale-aware spherical width frequency.
@@ -64,7 +80,7 @@ def _compute_sph_freq_w_adaptive(
         alpha = 1.0
     else:
         t = float(scale_idx) / (num_scales - 1)  # [0, 1]
-        
+
         if alpha_schedule == "linear":
             alpha = t
         elif alpha_schedule == "exp":
@@ -83,7 +99,7 @@ def _compute_sph_freq_w_adaptive(
     # Adaptive blend: start with standard, end with spherical
     eff_freq = alpha * sph_freq + (1.0 - alpha) * inv_freq
 
-    return eff_freq
+    return _blend_freq_with_band(inv_freq, eff_freq, band_ratio)
 
 
 def precompute_rope2d_freqs_grid_spherical_v2(
@@ -96,6 +112,7 @@ def precompute_rope2d_freqs_grid_spherical_v2(
     scaling_factor: float = 1.0,
     alpha_schedule: str = "linear",
     alpha_h: float = 0.0,
+    spherical_band_ratio: float = 1.0,
 ) -> Dict[str, torch.Tensor]:
     """
     Scale-aware Spherical RoPE version of precompute_rope2d_freqs_grid().
@@ -121,14 +138,15 @@ def precompute_rope2d_freqs_grid_spherical_v2(
     qtr_dim = half_dim // 2
 
     inv_freq = 1.0 / (
-        base ** (torch.arange(0, half_dim, 2, dtype=torch.float32).to(device) / half_dim)
+        base
+        ** (torch.arange(0, half_dim, 2, dtype=torch.float32).to(device) / half_dim)
     )  # [qtr_dim]
 
     rope2d_freqs_grid: Dict[str, torch.Tensor] = {}
 
     for h_div_w in dynamic_resolution_h_w:
         # Get finest scale (upw) from 1M resolution
-        scale_schedule_1M = dynamic_resolution_h_w[h_div_w]['1M']['scales']
+        scale_schedule_1M = dynamic_resolution_h_w[h_div_w]["1M"]["scales"]
         _, uph, upw = scale_schedule_1M[-1]
         num_scales = len(scale_schedule_1M)
 
@@ -139,8 +157,13 @@ def precompute_rope2d_freqs_grid_spherical_v2(
 
             # ── Adaptive spherical frequency ────────────────────────
             eff_freq_w = _compute_sph_freq_w_adaptive(
-                inv_freq, pw, upw, scale_idx, num_scales,
+                inv_freq,
+                pw,
+                upw,
+                scale_idx,
+                num_scales,
                 alpha_schedule=alpha_schedule,
+                band_ratio=spherical_band_ratio,
             )
 
             # Height (use standard unless alpha_h > 0)
@@ -154,34 +177,47 @@ def precompute_rope2d_freqs_grid_spherical_v2(
             # ── Width positions (depending on mode) ──────────────────
             if rope2d_normalized_by_hw == 2:
                 # star-style
-                t_w = (torch.arange(pw, device=device, dtype=torch.float32)
-                       * (upw / pw)).round() / scaling_factor
+                t_w = (
+                    torch.arange(pw, device=device, dtype=torch.float32) * (upw / pw)
+                ).round() / scaling_factor
             elif rope2d_normalized_by_hw == 1:
                 # bilinear
-                t_w = (torch.arange(pw, device=device, dtype=torch.float32)
-                       * (upw / pw)) / scaling_factor
+                t_w = (
+                    torch.arange(pw, device=device, dtype=torch.float32) * (upw / pw)
+                ) / scaling_factor
             else:  # mode 0: direct
-                t_w = torch.arange(pw, device=device, dtype=torch.float32) / scaling_factor
+                t_w = (
+                    torch.arange(pw, device=device, dtype=torch.float32)
+                    / scaling_factor
+                )
 
-            freqs_w = torch.outer(t_w, eff_freq_w)   # [pw, qtr_dim]
+            freqs_w = torch.outer(t_w, eff_freq_w)  # [pw, qtr_dim]
 
             # ── Height positions (depending on mode) ────────────────
             if rope2d_normalized_by_hw == 2:
-                t_h = (torch.arange(ph, device=device, dtype=torch.float32)
-                       * (uph / ph)).round() / scaling_factor
+                t_h = (
+                    torch.arange(ph, device=device, dtype=torch.float32) * (uph / ph)
+                ).round() / scaling_factor
             elif rope2d_normalized_by_hw == 1:
-                t_h = (torch.arange(ph, device=device, dtype=torch.float32)
-                       * (uph / ph)) / scaling_factor
+                t_h = (
+                    torch.arange(ph, device=device, dtype=torch.float32) * (uph / ph)
+                ) / scaling_factor
             else:  # mode 0
-                t_h = torch.arange(ph, device=device, dtype=torch.float32) / scaling_factor
+                t_h = (
+                    torch.arange(ph, device=device, dtype=torch.float32)
+                    / scaling_factor
+                )
 
-            freqs_h = torch.outer(t_h, eff_freq_h)   # [ph, qtr_dim]
+            freqs_h = torch.outer(t_h, eff_freq_h)  # [ph, qtr_dim]
 
             # ── 2D freqs grid ──────────────────────────────────────
-            freqs_grid = torch.cat([
-                freqs_h[:, None, :].expand(-1, pw, -1),   # [ph, pw, qtr_dim]
-                freqs_w[None, :, :].expand(ph, -1, -1),   # [ph, pw, qtr_dim]
-            ], dim=-1)  # [ph, pw, half_dim]
+            freqs_grid = torch.cat(
+                [
+                    freqs_h[:, None, :].expand(-1, pw, -1),  # [ph, pw, qtr_dim]
+                    freqs_w[None, :, :].expand(ph, -1, -1),  # [ph, pw, qtr_dim]
+                ],
+                dim=-1,
+            )  # [ph, pw, half_dim]
 
             rope_cache = torch.stack(
                 [torch.cos(freqs_grid), torch.sin(freqs_grid)], dim=0
@@ -197,11 +233,13 @@ def precompute_rope2d_freqs_grid_spherical_v2(
             pad = torch.zeros(2, pad_len, half_dim, device=device)
             cat_rope_cache = torch.cat([cat_rope_cache, pad], dim=1)
 
-        cat_rope_cache = cat_rope_cache[:, None, None, None]  # (2,1,1,1,seq_len,half_dim)
+        cat_rope_cache = cat_rope_cache[
+            :, None, None, None
+        ]  # (2,1,1,1,seq_len,half_dim)
 
         # Register for all pn ('0.06M', '0.25M', '1M')
         for pn in dynamic_resolution_h_w[h_div_w]:
-            scale_schedule = dynamic_resolution_h_w[h_div_w][pn]['scales']
+            scale_schedule = dynamic_resolution_h_w[h_div_w][pn]["scales"]
             tmp_schedule = [(1, h, w) for _, h, w in scale_schedule]
             rope2d_freqs_grid[str(tuple(tmp_schedule))] = cat_rope_cache
 
@@ -226,6 +264,8 @@ class ScaleAwareSphericalRoPEInfinityPatcher:
         alpha_schedule: str = "linear",
         alpha_h: float = 0.0,
         device: Optional[torch.device] = None,
+        head_split_ratio: Optional[float] = None,
+        spherical_band_ratio: float = 1.0,
     ):
         """
         Args:
@@ -238,12 +278,15 @@ class ScaleAwareSphericalRoPEInfinityPatcher:
         self.alpha_schedule = alpha_schedule
         self.alpha_h = alpha_h
         self._orig_grid: Optional[dict] = None
+        self._active_head_group_sizes: Optional[Tuple[int, int]] = None
+        self.head_split_ratio = head_split_ratio
+        self.spherical_band_ratio = spherical_band_ratio
 
         if device is None:
             try:
                 device = next(model.parameters()).device
             except StopIteration:
-                device = torch.device('cpu')
+                device = torch.device("cpu")
         self.device = device
 
         self._sph_grid = self._build_sph_grid()
@@ -254,9 +297,11 @@ class ScaleAwareSphericalRoPEInfinityPatcher:
         rope2d_normalized_by_hw = self.model.rope2d_normalized_by_hw
         pad_to_multiplier = self.model.pad_to_multiplier
 
-        print(f"[ScaleAwareSphericalRoPE] head_dim={head_dim}, "
-              f"rope2d_normalized_by_hw={rope2d_normalized_by_hw}, "
-              f"alpha_schedule={self.alpha_schedule}, alpha_h={self.alpha_h}")
+        print(
+            f"[ScaleAwareSphericalRoPE] head_dim={head_dim}, "
+            f"rope2d_normalized_by_hw={rope2d_normalized_by_hw}, "
+            f"alpha_schedule={self.alpha_schedule}, alpha_h={self.alpha_h}"
+        )
 
         return precompute_rope2d_freqs_grid_spherical_v2(
             dim=head_dim,
@@ -266,17 +311,61 @@ class ScaleAwareSphericalRoPEInfinityPatcher:
             device=self.device,
             alpha_schedule=self.alpha_schedule,
             alpha_h=self.alpha_h,
+            spherical_band_ratio=self.spherical_band_ratio,
         )
+
+    def _iter_self_attn_modules(self):
+        for block in getattr(self.model, "unregistered_blocks", []):
+            attn = getattr(block, "attn", None)
+            if attn is not None:
+                yield attn
+            sa = getattr(block, "sa", None)
+            if sa is not None:
+                yield sa
+
+    def _apply_head_group_sizes(self, sizes: Optional[Tuple[int, int]]):
+        for module in self._iter_self_attn_modules():
+            module.set_rope_head_group_sizes(sizes)
+
+    def _compute_head_group_sizes(self) -> Tuple[int, int]:
+        total_heads = getattr(self.model, "num_heads", None)
+        if total_heads is None:
+            raise ValueError("Model does not expose num_heads for head split")
+        ratio = float(self.head_split_ratio)
+        ratio = max(0.0, min(1.0, ratio))
+        structural = max(1, int(round(total_heads * ratio)))
+        structural = min(structural, total_heads - 1)
+        context = total_heads - structural
+        return context, structural
+
+    def _build_grouped_grid(self, base_grid: dict, structural_grid: dict) -> dict:
+        combined = {}
+        for key in base_grid:
+            base = base_grid[key]
+            struct = structural_grid[key].to(device=base.device, dtype=base.dtype)
+            combined[key] = torch.stack((base, struct), dim=0)
+        return combined
 
     def apply(self):
         """Apply to model (permanent)."""
         if self._orig_grid is None:
             self._orig_grid = self.model.rope2d_freqs_grid
-        self.model.rope2d_freqs_grid = self._sph_grid
+        if self.head_split_ratio is None:
+            self._apply_head_group_sizes(None)
+            self.model.rope2d_freqs_grid = self._sph_grid
+            self._active_head_group_sizes = None
+        else:
+            head_sizes = self._compute_head_group_sizes()
+            combined_grid = self._build_grouped_grid(self._orig_grid, self._sph_grid)
+            self._apply_head_group_sizes(head_sizes)
+            self.model.rope2d_freqs_grid = combined_grid
+            self._active_head_group_sizes = head_sizes
         print("[ScaleAwareSphericalRoPE] applied (permanent)")
 
     def restore(self):
         """Restore original RoPE."""
+        self._apply_head_group_sizes(None)
+        self._active_head_group_sizes = None
         if self._orig_grid is not None:
             self.model.rope2d_freqs_grid = self._orig_grid
             print("[ScaleAwareSphericalRoPE] restored (standard)")
@@ -291,6 +380,7 @@ class ScaleAwareSphericalRoPEInfinityPatcher:
 
 if __name__ == "__main__":
     import json, sys, os
+
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from infinity.utils.dynamic_resolution import dynamic_resolution_h_w
 
@@ -304,22 +394,22 @@ if __name__ == "__main__":
     # Test 3 alpha schedules
     for sched in ["linear", "exp", "sigmoid"]:
         print(f"\n✓ Testing alpha_schedule='{sched}'")
-        
+
         sph_grid = precompute_rope2d_freqs_grid_spherical_v2(
             dim=HEAD_DIM,
             dynamic_resolution_h_w=dynamic_resolution_h_w,
             rope2d_normalized_by_hw=2,
             pad_to_multiplier=PAD,
-            device=torch.device('cpu'),
+            device=torch.device("cpu"),
             alpha_schedule=sched,
             alpha_h=0.0,
         )
-        
+
         print(f"  - Cache keys: {len(sph_grid)}")
-        
+
         # Check one key
         ratio = 1.0
-        scale_schedule_raw = dynamic_resolution_h_w[ratio]['0.06M']['scales']
+        scale_schedule_raw = dynamic_resolution_h_w[ratio]["0.06M"]["scales"]
         scale_schedule = [(1, h, w) for _, h, w in scale_schedule_raw]
         key = str(tuple(scale_schedule))
         print(f"  - Key shape: {sph_grid[key].shape}")

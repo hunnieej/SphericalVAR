@@ -9,6 +9,7 @@
 """
 
 import json, os, sys, time
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -17,16 +18,21 @@ import numpy as np
 import torch
 from torch.cuda.amp import autocast
 
-from tools.run_infinity import gen_one_img, load_tokenizer, load_visual_tokenizer, load_transformer
+from tools.run_infinity import (
+    gen_one_img,
+    load_tokenizer,
+    load_visual_tokenizer,
+    load_transformer,
+)
 from infinity.utils.dynamic_resolution import dynamic_resolution_h_w
 from spherical_rope_infinity import SphericalRoPEInfinityPatcher
 
 # ── 설정 ─────────────────────────────────────────────────────────────────────
-PRETRAINED  = "pretrained"
-OUT_DIR     = "eval_outputs/comparison_2b"
-H_DIV_W     = 0.5      # 1:2 파노라마 비율
-PN          = "1M"  # 368×736px  (속도 확인용; 720×1440px 원하면 "1M"으로 변경)
-VAE_TYPE    = 32
+PRETRAINED = "pretrained"
+OUT_DIR = "eval_outputs/comparison_2b"
+H_DIV_W = 0.5  # 1:2 파노라마 비율
+PN = "1M"  # 368×736px  (속도 확인용; 720×1440px 원하면 "1M"으로 변경)
+VAE_TYPE = 32
 os.makedirs(OUT_DIR, exist_ok=True)
 
 PROMPTS = [
@@ -42,7 +48,8 @@ SEEDS = [0, 1234, 5536, 8650, 9902]
 def seam_ssim(img: np.ndarray, s: int = 32) -> float:
     """좌우 s픽셀 스트립 SSIM."""
     from skimage.metrics import structural_similarity as ssim
-    left  = img[:, :s,  :].astype(np.float32)
+
+    left = img[:, :s, :].astype(np.float32)
     right = img[:, -s:, :].astype(np.float32)
     score, _ = ssim(left, right, full=True, channel_axis=2, data_range=255.0)
     return float(score)
@@ -54,7 +61,7 @@ def seam_cont(img: np.ndarray) -> float:
     seam_grad = np.abs(gray[:, 0].astype(float) - gray[:, -1].astype(float)).mean()
     interior_grad = np.abs(np.diff(gray, axis=1))[:, 1:-1].mean()
     if interior_grad < 1e-6:
-        return float('nan')
+        return float("nan")
     return float(seam_grad / interior_grad)
 
 
@@ -74,49 +81,85 @@ def main():
     print("Loading Infinity 2B...")
 
     class ModelArgs(VaeArgs):
-        model_path      = f"{PRETRAINED}/infinity_2b_reg.pth"
+        model_path = f"{PRETRAINED}/infinity_2b_reg.pth"
         checkpoint_type = "torch"
-        model_type      = "infinity_2b"
-        rope2d_each_sa_layer         = 1
-        rope2d_normalized_by_hw      = 2
+        model_type = "infinity_2b"
+        rope2d_each_sa_layer = 1
+        rope2d_normalized_by_hw = 2
         use_scale_schedule_embedding = 0
-        pn                           = PN
-        use_bit_label                = 1
+        pn = PN
+        use_bit_label = 1
         add_lvl_embeding_only_first_block = 0
-        text_channels   = 2048
-        use_flex_attn   = 0
-        bf16            = 1
-        cache_dir       = "/dev/shm"
+        text_channels = 2048
+        use_flex_attn = 0
+        bf16 = 1
+        cache_dir = "/dev/shm"
         enable_model_cache = 0
 
     infinity = load_transformer(vae, ModelArgs())
 
     # ── scale_schedule (1:2, 1M) ──────────────────────────────────────────
-    scale_schedule_raw = dynamic_resolution_h_w[H_DIV_W][PN]['scales']
+    scale_schedule_raw = dynamic_resolution_h_w[H_DIV_W][PN]["scales"]
     scale_schedule = [(1, h, w) for (_, h, w) in scale_schedule_raw]
     finest = scale_schedule[-1]
-    print(f"Scale schedule: {len(scale_schedule)} scales, finest {finest[1]*16}x{finest[2]*16}px")
+    print(
+        f"Scale schedule: {len(scale_schedule)} scales, finest {finest[1] * 16}x{finest[2] * 16}px"
+    )
 
     # ── Spherical RoPE Patcher ────────────────────────────────────────────
-    patcher = SphericalRoPEInfinityPatcher(infinity, alpha_w=1.0)
+    PATCHER_SETTINGS = {
+        "spherical_all": dict(head_split_ratio=None, band_ratio=0.75),
+        "spherical_split": dict(head_split_ratio=0.75, band_ratio=0.5),
+    }
+    patchers = {
+        name: SphericalRoPEInfinityPatcher(
+            infinity,
+            alpha_w=1.0,
+            alpha_h=0.0,
+            head_split_ratio=settings["head_split_ratio"],
+            spherical_band_ratio=settings.get("band_ratio", 1.0),
+        )
+        for name, settings in PATCHER_SETTINGS.items()
+    }
 
     # ── 생성 & 평가 루프 ──────────────────────────────────────────────────
     all_results = []
 
-    for cond_name, use_sph in [("baseline", False), ("spherical_aw1.0", True)]:
-        if use_sph:
-            patcher.apply()
+    CONDITIONS = [
+        ("baseline", None),
+        ("spherical_all", PATCHER_SETTINGS["spherical_all"]),
+        ("spherical_split", PATCHER_SETTINGS["spherical_split"]),
+    ]
+
+    cond_display_map = {}
+    active_patcher = None
+    for cond_name, cond_cfg in CONDITIONS:
+        if cond_cfg and cond_cfg.get("head_split_ratio") is not None:
+            cond_tag = f"{cond_name}_r{cond_cfg['head_split_ratio']:.2f}_r{cond_cfg['band_ratio']:.2f}"
         else:
-            patcher.restore()
+            cond_tag = cond_name
+        cond_display_map[cond_name] = cond_tag
+        if active_patcher is not None:
+            active_patcher.restore()
+            active_patcher = None
+
+        if cond_cfg is None:
+            pass
+        else:
+            active_patcher = patchers[cond_name]
+            active_patcher.apply()
 
         for pi, (prompt, seed) in enumerate(zip(PROMPTS, SEEDS)):
-            print(f"\n[{cond_name}] prompt {pi+1}/{len(PROMPTS)}, seed={seed}")
+            print(f"\n[{cond_tag}] prompt {pi + 1}/{len(PROMPTS)}, seed={seed}")
 
             t0 = time.time()
             with autocast(dtype=torch.bfloat16):
                 with torch.no_grad():
                     img = gen_one_img(
-                        infinity, vae, text_tokenizer, text_encoder,
+                        infinity,
+                        vae,
+                        text_tokenizer,
+                        text_encoder,
                         prompt,
                         g_seed=seed,
                         gt_leak=0,
@@ -132,34 +175,40 @@ def main():
 
             img_np = img.cpu().numpy()
             h, w = img_np.shape[:2]
-            save_path = f"{OUT_DIR}/{cond_name}_p{pi:02d}_s{seed}.jpg"
+            save_path = f"{OUT_DIR}/{cond_tag}_p{pi:02d}_s{seed}.jpg"
             cv2.imwrite(save_path, img_np)
 
             ssim_val = seam_ssim(img_np)
             cont_val = seam_cont(img_np)
 
             result = {
-                "condition": cond_name,
+                "condition": cond_tag,
                 "prompt_idx": pi,
-                "seed":       seed,
+                "seed": seed,
                 "resolution": f"{w}x{h}",
-                "elapsed":    round(elapsed, 2),
-                "seam_ssim":  round(ssim_val, 4),
-                "seam_cont":  round(cont_val, 4) if not np.isnan(cont_val) else None,
-                "save_path":  save_path,
+                "elapsed": round(elapsed, 2),
+                "seam_ssim": round(ssim_val, 4),
+                "seam_cont": round(cont_val, 4) if not np.isnan(cont_val) else None,
+                "save_path": save_path,
             }
             all_results.append(result)
-            print(f"  {w}x{h}px  seam_ssim={ssim_val:.4f}  seam_cont={cont_val:.4f}  {elapsed:.1f}s")
+            print(
+                f"  {w}x{h}px  seam_ssim={ssim_val:.4f}  seam_cont={cont_val:.4f}  {elapsed:.1f}s"
+            )
 
-    patcher.restore()
+    if active_patcher is not None:
+        active_patcher.restore()
 
     # ── 요약 ─────────────────────────────────────────────────────────────
     print("\n" + "=" * 60)
-    for cond in ["baseline", "spherical_aw1.0"]:
-        res = [r for r in all_results if r["condition"] == cond]
+    for cond in [name for name, _ in CONDITIONS]:
+        display = cond_display_map[cond]
+        res = [r for r in all_results if r["condition"] == display]
         mean_ssim = np.mean([r["seam_ssim"] for r in res])
-        mean_cont = np.nanmean([r["seam_cont"] for r in res if r["seam_cont"] is not None])
-        print(f"{cond:<22}  seam_ssim={mean_ssim:.4f}  seam_cont={mean_cont:.4f}")
+        mean_cont = np.nanmean(
+            [r["seam_cont"] for r in res if r["seam_cont"] is not None]
+        )
+        print(f"{display:<22}  seam_ssim={mean_ssim:.4f}  seam_cont={mean_cont:.4f}")
 
     out_path = f"{OUT_DIR}/metrics.json"
     with open(out_path, "w") as f:
