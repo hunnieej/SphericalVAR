@@ -3,11 +3,12 @@
 
 실행법:
   cd /home/mmai6k_02/anaconda3/workspace/mnt/infinity
-  PYTHONPATH=. conda run -n infinity python run_comparison_2b.py
+  PYTHONPATH=. conda run -n infinity python run_comparison_2b.py --interp_mode nearest
 
 결과: eval_outputs/comparison_2b/ 에 이미지 저장 + metrics.json
 """
 
+import argparse
 import json, os, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -29,7 +30,7 @@ from spherical_rope_infinity import SphericalRoPEInfinityPatcher
 
 # ── 설정 ─────────────────────────────────────────────────────────────────────
 PRETRAINED = "pretrained"
-OUT_DIR = "eval_outputs/comparison_2b"
+OUT_DIR = "eval_outputs/comparison_2b_scale0T1"
 H_DIV_W = 0.5  # 1:2 파노라마 비율
 PN = "1M"  # 368×736px  (속도 확인용; 720×1440px 원하면 "1M"으로 변경)
 VAE_TYPE = 32
@@ -43,6 +44,77 @@ PROMPTS = [
     "This is a panorama image. The photo shows a quiet forest path in autumn, with golden and red leaves covering the ground.",
 ]
 SEEDS = [0, 1234, 5536, 8650, 9902]
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--out_dir",
+        type=str,
+        default=OUT_DIR,
+        help="Base output directory for images and metrics",
+    )
+    parser.add_argument(
+        "--interp_mode",
+        type=str,
+        default="",
+        choices=["", "nearest", "bilinear", "bicubic", "trilinear", "area"],
+        help="Override next-scale latent upsampling mode",
+    )
+    parser.add_argument(
+        "--interp_down_mode",
+        type=str,
+        default="",
+        choices=["", "nearest", "bilinear", "bicubic", "trilinear", "area"],
+        help="Optional downsampling override for VAE multiscale paths",
+    )
+    parser.add_argument(
+        "--rope_scales",
+        nargs="*",
+        default=None,
+        help="Scale indices to apply spherical RoPE to (default: all scales)",
+    )
+    parser.add_argument(
+        "--head_split_ratio",
+        type=float,
+        default=float(os.environ.get("HACK_HEAD_SPLIT_RATIO", 0.75)),
+        help="Head split ratio for spherical_split",
+    )
+    parser.add_argument(
+        "--band_ratio",
+        type=float,
+        default=float(os.environ.get("HACK_BAND_RATIO", 0.75)),
+        help="Band ratio for spherical_split",
+    )
+    parser.add_argument(
+        "--all_head_band_ratio",
+        type=float,
+        default=float(os.environ.get("HACK_ALL_HEAD_BAND_RATIO", 0.75)),
+        help="Band ratio for spherical_all",
+    )
+    return parser.parse_args()
+
+
+def resolve_rope_scales(scale_schedule, rope_scales):
+    if not rope_scales:
+        return None
+    if len(rope_scales) == 1 and rope_scales[0].lower() == "all":
+        return None
+    total = len(scale_schedule)
+    resolved = []
+    for token in rope_scales:
+        if token.lower() == "finest":
+            resolved.append(total - 1)
+        elif token.lower() == "coarsest":
+            resolved.append(0)
+        else:
+            idx = int(token)
+            if idx < 0 or idx >= total:
+                raise ValueError(
+                    f"rope scale index {idx} out of range (0..{total - 1})"
+                )
+            resolved.append(idx)
+    return sorted(set(resolved))
 
 
 def seam_ssim(img: np.ndarray, s: int = 32) -> float:
@@ -66,11 +138,21 @@ def seam_cont(img: np.ndarray) -> float:
 
 
 def main():
+    cli_args = parse_args()
+    interp_tag = cli_args.interp_mode or "default"
+    base_out_dir = cli_args.out_dir
+    out_dir = (
+        base_out_dir if not cli_args.interp_mode else f"{base_out_dir}_{interp_tag}"
+    )
+    os.makedirs(out_dir, exist_ok=True)
+
     # ── 모델 로딩 ─────────────────────────────────────────────────────────
     class VaeArgs:
         vae_type = VAE_TYPE
         vae_path = f"{PRETRAINED}/infinity_vae_d32reg.pth"
         apply_spatial_patchify = 0
+        interp_mode = cli_args.interp_mode
+        interp_down_mode = cli_args.interp_down_mode
 
     print("Loading T5...")
     text_tokenizer, text_encoder = load_tokenizer("google/flan-t5-xl")
@@ -101,6 +183,7 @@ def main():
     # ── scale_schedule (1:2, 1M) ──────────────────────────────────────────
     scale_schedule_raw = dynamic_resolution_h_w[H_DIV_W][PN]["scales"]
     scale_schedule = [(1, h, w) for (_, h, w) in scale_schedule_raw]
+    target_rope_scales = resolve_rope_scales(scale_schedule, cli_args.rope_scales)
     finest = scale_schedule[-1]
     print(
         f"Scale schedule: {len(scale_schedule)} scales, finest {finest[1] * 16}x{finest[2] * 16}px"
@@ -108,8 +191,12 @@ def main():
 
     # ── Spherical RoPE Patcher ────────────────────────────────────────────
     PATCHER_SETTINGS = {
-        "spherical_all": dict(head_split_ratio=None, band_ratio=0.75),
-        "spherical_split": dict(head_split_ratio=0.75, band_ratio=0.5),
+        "spherical_all": dict(
+            head_split_ratio=None, band_ratio=cli_args.all_head_band_ratio
+        ),
+        "spherical_split": dict(
+            head_split_ratio=cli_args.head_split_ratio, band_ratio=cli_args.band_ratio
+        ),
     }
     patchers = {
         name: SphericalRoPEInfinityPatcher(
@@ -118,6 +205,7 @@ def main():
             alpha_h=0.0,
             head_split_ratio=settings["head_split_ratio"],
             spherical_band_ratio=settings.get("band_ratio", 1.0),
+            target_scales=target_rope_scales,
         )
         for name, settings in PATCHER_SETTINGS.items()
     }
@@ -175,7 +263,7 @@ def main():
 
             img_np = img.cpu().numpy()
             h, w = img_np.shape[:2]
-            save_path = f"{OUT_DIR}/{cond_tag}_p{pi:02d}_s{seed}.jpg"
+            save_path = f"{out_dir}/{interp_tag}_{cond_tag}_p{pi:02d}_s{seed}.jpg"
             cv2.imwrite(save_path, img_np)
 
             ssim_val = seam_ssim(img_np)
@@ -189,6 +277,7 @@ def main():
                 "elapsed": round(elapsed, 2),
                 "seam_ssim": round(ssim_val, 4),
                 "seam_cont": round(cont_val, 4) if not np.isnan(cont_val) else None,
+                "interp_mode": interp_tag,
                 "save_path": save_path,
             }
             all_results.append(result)
@@ -210,7 +299,7 @@ def main():
         )
         print(f"{display:<22}  seam_ssim={mean_ssim:.4f}  seam_cont={mean_cont:.4f}")
 
-    out_path = f"{OUT_DIR}/metrics.json"
+    out_path = f"{out_dir}/metrics.json"
     with open(out_path, "w") as f:
         json.dump(all_results, f, indent=2)
     print(f"\nSaved → {out_path}")

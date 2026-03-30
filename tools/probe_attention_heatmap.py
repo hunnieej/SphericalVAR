@@ -122,6 +122,12 @@ def parse_args():
         default=0.5,
         help="Spherical band ratio for non-baseline conditions",
     )
+    parser.add_argument(
+        "--rope_scales",
+        nargs="*",
+        default=None,
+        help="Scale indices to apply spherical RoPE to (default: all scales)",
+    )
     return parser.parse_args()
 
 
@@ -172,6 +178,29 @@ def build_target_scales(args, scale_schedule):
             start, end = end, start
         return list(range(start, end + 1))
     return [resolve_scale_index(scale_schedule, args.scale)]
+
+
+def resolve_rope_scales(rope_scales, scale_schedule):
+    if not rope_scales:
+        return None
+    total = len(scale_schedule)
+    if len(rope_scales) == 1 and rope_scales[0].lower() == "all":
+        return None
+    resolved = []
+    for token in rope_scales:
+        lowered = token.lower()
+        if lowered == "finest":
+            resolved.append(total - 1)
+        elif lowered == "coarsest":
+            resolved.append(0)
+        else:
+            idx = int(token)
+            if idx < 0 or idx >= total:
+                raise ValueError(
+                    f"rope scale index {idx} out of range (0..{total - 1})"
+                )
+            resolved.append(idx)
+    return sorted(set(resolved))
 
 
 def prepare_model(args):
@@ -313,6 +342,7 @@ def main():
     scale_schedule = dynamic_resolution_h_w[args.h_div_w][args.pn]["scales"]
     scale_schedule = [(1, h, w) for (_, h, w) in scale_schedule]
     target_scales = build_target_scales(args, scale_schedule)
+    target_rope_scales = resolve_rope_scales(args.rope_scales, scale_schedule)
     scale_dims = {
         idx: (scale_schedule[idx][1], scale_schedule[idx][2])
         for idx in range(len(scale_schedule))
@@ -329,6 +359,7 @@ def main():
                 None if args.condition == "spherical_all" else args.head_split_ratio
             ),
             spherical_band_ratio=args.band_ratio,
+            target_scales=target_rope_scales,
         )
         patcher.apply()
 

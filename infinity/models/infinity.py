@@ -32,6 +32,7 @@ from infinity.models.basic import (
 from infinity.utils import misc
 from infinity.models.flex_attn import FlexAttn
 from infinity.utils.dynamic_resolution import dynamic_resolution_h_w, h_div_w_templates
+from infinity.models.bsq_vae.interp_utils import interpolate_latent
 
 try:
     from infinity.models.fused_op import fused_ada_layer_norm, fused_ada_rms_norm
@@ -928,12 +929,12 @@ class Infinity(nn.Module):
                     idx_Bld, label_type="bit_label"
                 )  # [B, d, 1, h, w] or [B, d, 1, 2h, 2w]
                 if si != num_stages_minus_1:
-                    summed_codes += F.interpolate(
+                    summed_codes += interpolate_latent(
                         codes,
                         size=vae_scale_schedule[-1],
                         mode=vae.quantizer.z_interplote_up,
                     )
-                    last_stage = F.interpolate(
+                    last_stage = interpolate_latent(
                         summed_codes,
                         size=vae_scale_schedule[si + 1],
                         mode=vae.quantizer.z_interplote_up,

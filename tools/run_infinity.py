@@ -388,6 +388,18 @@ def load_visual_tokenizer(args):
             decoder_ch_mult=decoder_ch_mult,
             test_mode=True,
         ).to(device)
+        interp_mode = getattr(args, "interp_mode", None)
+        if interp_mode:
+            print(
+                f"[VAE] override z_interplote_up: {vae.quantizer.z_interplote_up} -> {interp_mode}"
+            )
+            vae.quantizer.z_interplote_up = interp_mode
+        interp_down_mode = getattr(args, "interp_down_mode", None)
+        if interp_down_mode:
+            print(
+                f"[VAE] override z_interplote_down: {vae.quantizer.z_interplote_down} -> {interp_down_mode}"
+            )
+            vae.quantizer.z_interplote_down = interp_down_mode
     else:
         raise ValueError(f"vae_type={args.vae_type} not supported")
     return vae
@@ -537,7 +549,21 @@ def add_common_arguments(parser):
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--cfg_insertion_layer", type=int, default=0)
     parser.add_argument("--vae_type", type=int, default=32)
-    parser.add_argument("--vae_path", type=str, default="pretrained/infinity_vae_d32reg.pth")
+    parser.add_argument(
+        "--vae_path", type=str, default="pretrained/infinity_vae_d32reg.pth"
+    )
+    parser.add_argument(
+        "--interp_mode",
+        type=str,
+        default="",
+        choices=["", "nearest", "bilinear", "bicubic", "trilinear", "area"],
+    )
+    parser.add_argument(
+        "--interp_down_mode",
+        type=str,
+        default="",
+        choices=["", "nearest", "bilinear", "bicubic", "trilinear", "area"],
+    )
     parser.add_argument(
         "--add_lvl_embeding_only_first_block", type=int, default=0, choices=[0, 1]
     )

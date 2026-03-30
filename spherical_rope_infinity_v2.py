@@ -25,8 +25,9 @@ References:
 """
 
 import math
+import ast
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -266,6 +267,7 @@ class ScaleAwareSphericalRoPEInfinityPatcher:
         device: Optional[torch.device] = None,
         head_split_ratio: Optional[float] = None,
         spherical_band_ratio: float = 1.0,
+        target_scales: Optional[Sequence[int]] = None,
     ):
         """
         Args:
@@ -281,6 +283,11 @@ class ScaleAwareSphericalRoPEInfinityPatcher:
         self._active_head_group_sizes: Optional[Tuple[int, int]] = None
         self.head_split_ratio = head_split_ratio
         self.spherical_band_ratio = spherical_band_ratio
+        self.target_scales = (
+            None
+            if target_scales is None
+            else tuple(sorted(set(int(x) for x in target_scales)))
+        )
 
         if device is None:
             try:
@@ -346,17 +353,55 @@ class ScaleAwareSphericalRoPEInfinityPatcher:
             combined[key] = torch.stack((base, struct), dim=0)
         return combined
 
+    def _get_scale_spans(self, schedule_key: str) -> List[Tuple[int, int]]:
+        scale_schedule = ast.literal_eval(schedule_key)
+        spans = []
+        start = 0
+        for pt, ph, pw in scale_schedule:
+            length = pt * ph * pw
+            spans.append((start, start + length))
+            start += length
+        return spans
+
+    def _merge_scale_selected_grid(
+        self, base_grid: dict, structural_grid: dict
+    ) -> dict:
+        if self.target_scales is None:
+            return {
+                key: structural_grid[key].to(
+                    device=base_grid[key].device, dtype=base_grid[key].dtype
+                )
+                for key in base_grid
+            }
+
+        merged = {}
+        for key in base_grid:
+            base = base_grid[key]
+            struct = structural_grid[key].to(device=base.device, dtype=base.dtype)
+            mixed = base.clone()
+            spans = self._get_scale_spans(key)
+            for scale_idx in self.target_scales:
+                if scale_idx < 0 or scale_idx >= len(spans):
+                    continue
+                start, end = spans[scale_idx]
+                mixed[..., start:end, :] = struct[..., start:end, :]
+            merged[key] = mixed
+        return merged
+
     def apply(self):
         """Apply to model (permanent)."""
         if self._orig_grid is None:
             self._orig_grid = self.model.rope2d_freqs_grid
+        merged_sph_grid = self._merge_scale_selected_grid(
+            self._orig_grid, self._sph_grid
+        )
         if self.head_split_ratio is None:
             self._apply_head_group_sizes(None)
-            self.model.rope2d_freqs_grid = self._sph_grid
+            self.model.rope2d_freqs_grid = merged_sph_grid
             self._active_head_group_sizes = None
         else:
             head_sizes = self._compute_head_group_sizes()
-            combined_grid = self._build_grouped_grid(self._orig_grid, self._sph_grid)
+            combined_grid = self._build_grouped_grid(self._orig_grid, merged_sph_grid)
             self._apply_head_group_sizes(head_sizes)
             self.model.rope2d_freqs_grid = combined_grid
             self._active_head_group_sizes = head_sizes
