@@ -1,4 +1,5 @@
 import argparse
+import math
 import json
 import os
 import re
@@ -107,6 +108,13 @@ def parse_args():
         help="Global quantile threshold for structural heads",
     )
     parser.add_argument(
+        "--alpha",
+        nargs="*",
+        type=float,
+        default=None,
+        help="Structural top-ratio(s), e.g. 0.1 0.2 0.3",
+    )
+    parser.add_argument(
         "--output",
         type=str,
         default="probe_outputs/head_classification/head_classification_h1.json",
@@ -141,6 +149,64 @@ def resolve_prompt_seeds(num_prompts: int, base_seed: int):
         else:
             seeds.append(base_seed + idx)
     return seeds
+
+
+def alpha_tag(alpha: float) -> str:
+    return f"a{int(round(alpha * 100)):03d}"
+
+
+def build_layer_head_map(items):
+    out = {}
+    for item in items:
+        layer_idx = int(item["layer"][1:])
+        out.setdefault(str(layer_idx), []).append(int(item["head"]))
+    for key in out:
+        out[key] = sorted(set(out[key]))
+    return out
+
+
+def write_alpha_configs(base_output: Path, aggregated, alphas):
+    if not alphas:
+        return []
+    total = len(aggregated)
+    written = []
+    for alpha in alphas:
+        if alpha <= 0 or alpha > 1:
+            raise ValueError(f"alpha must be in (0, 1], got {alpha}")
+        k = max(1, int(math.ceil(total * alpha)))
+        structural = aggregated[:k]
+        contextual = aggregated[k:]
+        structural_map = build_layer_head_map(structural)
+        contextual_map = build_layer_head_map(contextual)
+        stem = base_output.stem
+        struct_path = base_output.with_name(
+            f"{stem}_{alpha_tag(alpha)}_structural_heads.json"
+        )
+        context_path = base_output.with_name(
+            f"{stem}_{alpha_tag(alpha)}_contextual_heads.json"
+        )
+        summary_path = base_output.with_name(
+            f"{stem}_{alpha_tag(alpha)}_split_summary.json"
+        )
+        with open(struct_path, "w", encoding="utf-8") as f:
+            json.dump(structural_map, f, indent=2)
+        with open(context_path, "w", encoding="utf-8") as f:
+            json.dump(contextual_map, f, indent=2)
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "alpha": alpha,
+                    "num_total_heads": total,
+                    "num_structural_heads": k,
+                    "num_contextual_heads": total - k,
+                    "structural_config": structural_map,
+                    "contextual_config": contextual_map,
+                },
+                f,
+                indent=2,
+            )
+        written.append((alpha, struct_path, context_path, summary_path))
+    return written
 
 
 def resolve_rope_scales(rope_scales, scale_schedule):
@@ -570,6 +636,8 @@ def main():
         )
 
     aggregated.sort(key=lambda x: x["mean_query_variance"], reverse=True)
+    for rank, item in enumerate(aggregated, start=1):
+        item["rank"] = rank
     output = {
         "condition": args.condition,
         "pn": args.pn,
@@ -580,6 +648,7 @@ def main():
         "layer_head_map": layer_head_map,
         "threshold_quantile": args.quantile,
         "threshold_value": threshold,
+        "alpha_values": args.alpha,
         "generation": {
             "cfg": args.cfg,
             "tau": args.tau,
@@ -594,6 +663,12 @@ def main():
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2)
     print(f"Saved head classification to {output_path}")
+
+    alpha_files = write_alpha_configs(output_path, aggregated, args.alpha)
+    for alpha, struct_path, context_path, summary_path in alpha_files:
+        print(
+            f"Saved alpha={alpha:.2f} configs → {struct_path.name}, {context_path.name}, {summary_path.name}"
+        )
 
     if args.save_heatmaps:
         aggregate_maps = {}
