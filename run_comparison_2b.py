@@ -10,6 +10,7 @@
 
 import argparse
 import json, os, sys, time
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -17,6 +18,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import cv2
 import numpy as np
 import torch
+import yaml
 from torch.cuda.amp import autocast
 
 from tools.run_infinity import (
@@ -31,7 +33,7 @@ from spherical_rope_infinity import SphericalRoPEInfinityPatcher
 
 # ── 설정 ─────────────────────────────────────────────────────────────────────
 PRETRAINED = "pretrained"
-OUT_DIR = "eval_outputs/comparison_2b_HL_sort_all"
+OUT_DIR = "eval_outputs/comparison_2b_HL_a1"
 H_DIV_W = 0.5  # 1:2 파노라마 비율
 PN = "1M"  # 368×736px  (속도 확인용; 720×1440px 원하면 "1M"으로 변경)
 VAE_TYPE = 32
@@ -106,6 +108,28 @@ def parse_args():
         help="JSON/txt file describing exact spherical head selection",
     )
     return parser.parse_args()
+
+
+def build_experiment_metadata(cli_args, target_rope_scales, layer_head_map):
+    metadata = {
+        "interp_mode": cli_args.interp_mode or "default",
+        "interp_down_mode": cli_args.interp_down_mode or "default",
+        "rope_scales": target_rope_scales if target_rope_scales is not None else "all",
+        "head_split_ratio": cli_args.head_split_ratio,
+        "band_ratio": cli_args.band_ratio,
+        "all_head_band_ratio": cli_args.all_head_band_ratio,
+        "layer_head_spec": cli_args.layer_head_spec or None,
+        "layer_head_spec_file": cli_args.layer_head_spec_file or None,
+        "layer_head_map": layer_head_map,
+    }
+    return metadata
+
+
+def save_experiment_metadata(out_dir, metadata):
+    yaml_path = Path(out_dir) / "experiment_config.yaml"
+    with open(yaml_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(metadata, f, sort_keys=False, allow_unicode=False)
+    return str(yaml_path)
 
 
 def resolve_rope_scales(scale_schedule, rope_scales):
@@ -265,6 +289,11 @@ def main():
     print(
         f"Scale schedule: {len(scale_schedule)} scales, finest {finest[1] * 16}x{finest[2] * 16}px"
     )
+    metadata_path = save_experiment_metadata(
+        out_dir,
+        build_experiment_metadata(cli_args, target_rope_scales, layer_head_map),
+    )
+    print(f"Saved → {metadata_path}")
 
     # ── Spherical RoPE Patcher ────────────────────────────────────────────
     PATCHER_SETTINGS = {
@@ -305,13 +334,7 @@ def main():
     active_patcher = None
     for cond_name, cond_cfg in CONDITIONS:
         if cond_cfg and cond_cfg.get("layer_head_map") is not None:
-            layer_chunks = [
-                f"L{layer_idx}H{'-'.join(str(h) for h in heads)}"
-                for layer_idx, heads in sorted(cond_cfg["layer_head_map"].items())
-            ]
-            cond_tag = (
-                f"{cond_name}_{'_'.join(layer_chunks)}_r{cond_cfg['band_ratio']:.2f}"
-            )
+            cond_tag = f"{cond_name}_custom_r{cond_cfg['band_ratio']:.2f}"
         elif cond_cfg and cond_cfg.get("head_split_ratio") is not None:
             cond_tag = f"{cond_name}_r{cond_cfg['head_split_ratio']:.2f}_r{cond_cfg['band_ratio']:.2f}"
         else:

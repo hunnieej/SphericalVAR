@@ -117,7 +117,7 @@ def parse_args():
     parser.add_argument(
         "--output",
         type=str,
-        default="probe_outputs/head_classification/head_classification_h1.json",
+        default="probe_outputs/head_classification/head_classification.json",
     )
     parser.add_argument(
         "--save_heatmaps",

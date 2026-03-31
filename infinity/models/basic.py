@@ -471,9 +471,11 @@ class SelfAttention(nn.Module):
                 f"Expected {self.num_heads} head group ids, got {len(group_ids)}"
             )
         unique_ids = sorted(set(int(v) for v in group_ids))
-        if unique_ids != list(range(len(unique_ids))):
+        if any(v < 0 for v in unique_ids):
+            raise ValueError(f"Head group ids must be non-negative, got {unique_ids}")
+        if any(v > 1 for v in unique_ids):
             raise ValueError(
-                f"Head group ids must be contiguous starting at 0, got {unique_ids}"
+                f"Current grouped RoPE cache supports only group ids 0/1, got {unique_ids}"
             )
         self.rope_head_group_ids = torch.tensor(group_ids, dtype=torch.long)
         sizes = []
