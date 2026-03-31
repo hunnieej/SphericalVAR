@@ -278,6 +278,7 @@ class SphericalRoPEInfinityPatcher:
         head_split_ratio: Optional[float] = None,
         spherical_band_ratio: float = 1.0,
         target_scales: Optional[Sequence[int]] = None,
+        layer_head_map: Optional[Dict[int, Sequence[int]]] = None,
     ):
         """
         Args:
@@ -298,6 +299,16 @@ class SphericalRoPEInfinityPatcher:
             if target_scales is None
             else tuple(sorted(set(int(x) for x in target_scales)))
         )
+        self.layer_head_map = (
+            None
+            if layer_head_map is None
+            else {
+                int(layer_idx): tuple(sorted(set(int(h) for h in heads)))
+                for layer_idx, heads in layer_head_map.items()
+            }
+        )
+        if self.layer_head_map is not None and self.head_split_ratio is not None:
+            raise ValueError("Use either head_split_ratio or layer_head_map, not both")
 
         if device is None:
             try:
@@ -333,17 +344,34 @@ class SphericalRoPEInfinityPatcher:
         )
 
     def _iter_self_attn_modules(self):
-        for block in getattr(self.model, "unregistered_blocks", []):
+        for layer_idx, block in enumerate(
+            getattr(self.model, "unregistered_blocks", [])
+        ):
             attn = getattr(block, "attn", None)
             if attn is not None:
-                yield attn
+                yield layer_idx, attn
             sa = getattr(block, "sa", None)
             if sa is not None:
-                yield sa
+                yield layer_idx, sa
 
     def _apply_head_group_sizes(self, sizes: Optional[Tuple[int, int]]):
-        for module in self._iter_self_attn_modules():
+        for _, module in self._iter_self_attn_modules():
             module.set_rope_head_group_sizes(sizes)
+
+    def _apply_layer_head_map(self, layer_head_map: Optional[Dict[int, Sequence[int]]]):
+        for layer_idx, module in self._iter_self_attn_modules():
+            if layer_head_map is None:
+                module.set_rope_head_group_ids(None)
+                continue
+            structural_heads = tuple(layer_head_map.get(layer_idx, ()))
+            group_ids = [0] * module.num_heads
+            for head_idx in structural_heads:
+                if head_idx < 0 or head_idx >= module.num_heads:
+                    raise ValueError(
+                        f"Invalid head index {head_idx} for layer {layer_idx} with {module.num_heads} heads"
+                    )
+                group_ids[head_idx] = 1
+            module.set_rope_head_group_ids(group_ids)
 
     def _compute_head_group_sizes(self) -> Tuple[int, int]:
         total_heads = getattr(self.model, "num_heads", None)
@@ -406,7 +434,12 @@ class SphericalRoPEInfinityPatcher:
         merged_sph_grid = self._merge_scale_selected_grid(
             self._orig_grid, self._sph_grid
         )
-        if self.head_split_ratio is None:
+        if self.layer_head_map is not None:
+            combined_grid = self._build_grouped_grid(self._orig_grid, merged_sph_grid)
+            self._apply_layer_head_map(self.layer_head_map)
+            self.model.rope2d_freqs_grid = combined_grid
+            self._active_head_group_sizes = None
+        elif self.head_split_ratio is None:
             self._apply_head_group_sizes(None)
             self.model.rope2d_freqs_grid = merged_sph_grid
             self._active_head_group_sizes = None
@@ -420,6 +453,7 @@ class SphericalRoPEInfinityPatcher:
 
     def restore(self):
         """원래 표준 RoPE로 복원."""
+        self._apply_layer_head_map(None)
         self._apply_head_group_sizes(None)
         self._active_head_group_sizes = None
         if self._orig_grid is not None:

@@ -25,12 +25,13 @@ from tools.run_infinity import (
     load_visual_tokenizer,
     load_transformer,
 )
+from tools.layer_head_spec_utils import resolve_layer_head_map
 from infinity.utils.dynamic_resolution import dynamic_resolution_h_w
 from spherical_rope_infinity import SphericalRoPEInfinityPatcher
 
 # ── 설정 ─────────────────────────────────────────────────────────────────────
 PRETRAINED = "pretrained"
-OUT_DIR = "eval_outputs/comparison_2b_scale0T1"
+OUT_DIR = "eval_outputs/comparison_2b_HL_sort_all"
 H_DIV_W = 0.5  # 1:2 파노라마 비율
 PN = "1M"  # 368×736px  (속도 확인용; 720×1440px 원하면 "1M"으로 변경)
 VAE_TYPE = 32
@@ -38,7 +39,7 @@ os.makedirs(OUT_DIR, exist_ok=True)
 
 PROMPTS = [
     "This is a panorama image. The photo shows a breathtaking snowy mountain summit at sunrise, with golden light illuminating the peaks and valleys stretching endlessly in all directions.",
-    "This is a panorama image. The photo shows a modern city skyline at night, with glittering lights reflecting off a calm river and bridges connecting both banks.",
+    "This is a panorama image. The photo shows a spectacular fireworks display exploding in the night sky above a modern city skyline, with glittering lights reflecting off a calm river and bridges connecting both banks.",
     "This is a panorama image. The photo shows a tranquil tropical beach at sunset, with crystal-clear turquoise water, white sand, and palm trees.",
     "This is a panorama image. The photo shows the interior of a grand cathedral with soaring gothic arches, stained glass windows casting colorful light on the stone floor.",
     "This is a panorama image. The photo shows a quiet forest path in autumn, with golden and red leaves covering the ground.",
@@ -77,20 +78,32 @@ def parse_args():
     parser.add_argument(
         "--head_split_ratio",
         type=float,
-        default=float(os.environ.get("HACK_HEAD_SPLIT_RATIO", 0.75)),
+        default=float(os.environ.get("HACK_HEAD_SPLIT_RATIO", 0.5)),
         help="Head split ratio for spherical_split",
     )
     parser.add_argument(
         "--band_ratio",
         type=float,
-        default=float(os.environ.get("HACK_BAND_RATIO", 0.75)),
+        default=float(os.environ.get("HACK_BAND_RATIO", 0.5)),
         help="Band ratio for spherical_split",
     )
     parser.add_argument(
         "--all_head_band_ratio",
         type=float,
-        default=float(os.environ.get("HACK_ALL_HEAD_BAND_RATIO", 0.75)),
+        default=float(os.environ.get("HACK_ALL_HEAD_BAND_RATIO", 0.5)),
         help="Band ratio for spherical_all",
+    )
+    parser.add_argument(
+        "--layer_head_spec",
+        type=str,
+        default="",
+        help="Exact spherical head selection, e.g. '0:5,6;6:6'",
+    )
+    parser.add_argument(
+        "--layer_head_spec_file",
+        type=str,
+        default="",
+        help="JSON/txt file describing exact spherical head selection",
     )
     return parser.parse_args()
 
@@ -135,6 +148,67 @@ def seam_cont(img: np.ndarray) -> float:
     if interior_grad < 1e-6:
         return float("nan")
     return float(seam_grad / interior_grad)
+
+
+def build_comparison_grid(
+    all_results, conditions, cond_display_map, out_dir, interp_tag
+):
+    grouped = {
+        (item["prompt_idx"], item["seed"], item["condition"]): item["save_path"]
+        for item in all_results
+    }
+    display_order = [cond_display_map[name] for name, _ in conditions]
+    rows = []
+    for pi, seed in enumerate(SEEDS):
+        tiles = []
+        for display in display_order:
+            path = grouped.get((pi, seed, display))
+            if path is None:
+                continue
+            img = cv2.imread(path, cv2.IMREAD_COLOR)
+            if img is None:
+                continue
+            label_h = 36
+            tile = np.full(
+                (img.shape[0] + label_h, img.shape[1], 3), 255, dtype=np.uint8
+            )
+            tile[label_h:, :, :] = img
+            cv2.putText(
+                tile,
+                display,
+                (12, 24),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 0, 0),
+                2,
+                cv2.LINE_AA,
+            )
+            tiles.append(tile)
+        if not tiles:
+            continue
+        row = cv2.hconcat(tiles)
+        row_label_h = 34
+        row_canvas = np.full(
+            (row.shape[0] + row_label_h, row.shape[1], 3), 255, dtype=np.uint8
+        )
+        row_canvas[row_label_h:, :, :] = row
+        cv2.putText(
+            row_canvas,
+            f"prompt {pi:02d}  seed {seed}",
+            (12, 24),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            (0, 0, 0),
+            2,
+            cv2.LINE_AA,
+        )
+        rows.append(row_canvas)
+    if not rows:
+        return None
+    grid = cv2.vconcat(rows)
+    grid_path = f"{out_dir}/{interp_tag}_comparison_grid.jpg"
+    cv2.imwrite(grid_path, grid)
+    return grid_path
 
 
 def main():
@@ -184,6 +258,9 @@ def main():
     scale_schedule_raw = dynamic_resolution_h_w[H_DIV_W][PN]["scales"]
     scale_schedule = [(1, h, w) for (_, h, w) in scale_schedule_raw]
     target_rope_scales = resolve_rope_scales(scale_schedule, cli_args.rope_scales)
+    layer_head_map = resolve_layer_head_map(
+        cli_args.layer_head_spec, cli_args.layer_head_spec_file
+    )
     finest = scale_schedule[-1]
     print(
         f"Scale schedule: {len(scale_schedule)} scales, finest {finest[1] * 16}x{finest[2] * 16}px"
@@ -195,7 +272,11 @@ def main():
             head_split_ratio=None, band_ratio=cli_args.all_head_band_ratio
         ),
         "spherical_split": dict(
-            head_split_ratio=cli_args.head_split_ratio, band_ratio=cli_args.band_ratio
+            head_split_ratio=None
+            if layer_head_map is not None
+            else cli_args.head_split_ratio,
+            band_ratio=cli_args.band_ratio,
+            layer_head_map=layer_head_map,
         ),
     }
     patchers = {
@@ -206,6 +287,7 @@ def main():
             head_split_ratio=settings["head_split_ratio"],
             spherical_band_ratio=settings.get("band_ratio", 1.0),
             target_scales=target_rope_scales,
+            layer_head_map=settings.get("layer_head_map"),
         )
         for name, settings in PATCHER_SETTINGS.items()
     }
@@ -222,7 +304,15 @@ def main():
     cond_display_map = {}
     active_patcher = None
     for cond_name, cond_cfg in CONDITIONS:
-        if cond_cfg and cond_cfg.get("head_split_ratio") is not None:
+        if cond_cfg and cond_cfg.get("layer_head_map") is not None:
+            layer_chunks = [
+                f"L{layer_idx}H{'-'.join(str(h) for h in heads)}"
+                for layer_idx, heads in sorted(cond_cfg["layer_head_map"].items())
+            ]
+            cond_tag = (
+                f"{cond_name}_{'_'.join(layer_chunks)}_r{cond_cfg['band_ratio']:.2f}"
+            )
+        elif cond_cfg and cond_cfg.get("head_split_ratio") is not None:
             cond_tag = f"{cond_name}_r{cond_cfg['head_split_ratio']:.2f}_r{cond_cfg['band_ratio']:.2f}"
         else:
             cond_tag = cond_name
@@ -303,6 +393,12 @@ def main():
     with open(out_path, "w") as f:
         json.dump(all_results, f, indent=2)
     print(f"\nSaved → {out_path}")
+
+    grid_path = build_comparison_grid(
+        all_results, CONDITIONS, cond_display_map, out_dir, interp_tag
+    )
+    if grid_path is not None:
+        print(f"Saved → {grid_path}")
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ Definitions of blocks of VAR transformer model.
 import math
 import os
 from functools import partial
-from typing import Optional, Tuple, Union
+from typing import Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -369,6 +369,9 @@ class SelfAttention(nn.Module):
 
         self.rope2d_normalized_by_hw = rope2d_normalized_by_hw
         self.rope_head_group_sizes: Optional[Tuple[int, ...]] = None
+        self.rope_head_group_ids: Optional[torch.Tensor] = None
+        self.attn_capture_cfg = None
+        self._relative_index_cache = {}
 
     def kv_caching(self, enable: bool):  # kv caching: only used during inference
         self.caching = enable
@@ -389,7 +392,28 @@ class SelfAttention(nn.Module):
         else:
             q_bhl, k_bhl = q, k
 
-        if self.rope_head_group_sizes:
+        if self.rope_head_group_ids is not None:
+            group_ids = self.rope_head_group_ids.to(device=q_bhl.device)
+            q_rot = torch.empty_like(q_bhl)
+            k_rot = torch.empty_like(k_bhl)
+            for gi in sorted(int(v) for v in group_ids.unique().tolist()):
+                head_mask = group_ids == gi
+                qg = q_bhl[:, head_mask]
+                kg = k_bhl[:, head_mask]
+                qg_rot, kg_rot = apply_rotary_emb(
+                    qg,
+                    kg,
+                    scale_schedule,
+                    rope2d_freqs_grid,
+                    self.pad_to_multiplier,
+                    self.rope2d_normalized_by_hw,
+                    scale_ind,
+                    group_idx=gi,
+                )
+                q_rot[:, head_mask] = qg_rot
+                k_rot[:, head_mask] = kg_rot
+            q_bhl, k_bhl = q_rot, k_rot
+        elif self.rope_head_group_sizes:
             q_split = torch.split(q_bhl, self.rope_head_group_sizes, dim=1)
             k_split = torch.split(k_bhl, self.rope_head_group_sizes, dim=1)
             q_rot, k_rot = [], []
@@ -426,11 +450,106 @@ class SelfAttention(nn.Module):
     def set_rope_head_group_sizes(self, sizes: Optional[Tuple[int, ...]]):
         if sizes is None:
             self.rope_head_group_sizes = None
+            self.rope_head_group_ids = None
             return
         assert sum(sizes) == self.num_heads, (
             f"Invalid rope head group sizes {sizes} for num_heads={self.num_heads}"
         )
         self.rope_head_group_sizes = tuple(sizes)
+        ids = []
+        for gi, size in enumerate(sizes):
+            ids.extend([gi] * size)
+        self.rope_head_group_ids = torch.tensor(ids, dtype=torch.long)
+
+    def set_rope_head_group_ids(self, group_ids: Optional[Sequence[int]]):
+        if group_ids is None:
+            self.rope_head_group_sizes = None
+            self.rope_head_group_ids = None
+            return
+        if len(group_ids) != self.num_heads:
+            raise ValueError(
+                f"Expected {self.num_heads} head group ids, got {len(group_ids)}"
+            )
+        unique_ids = sorted(set(int(v) for v in group_ids))
+        if unique_ids != list(range(len(unique_ids))):
+            raise ValueError(
+                f"Head group ids must be contiguous starting at 0, got {unique_ids}"
+            )
+        self.rope_head_group_ids = torch.tensor(group_ids, dtype=torch.long)
+        sizes = []
+        for gi in unique_ids:
+            sizes.append(sum(int(v) == gi for v in group_ids))
+        self.rope_head_group_sizes = tuple(sizes)
+
+    def configure_attn_capture(
+        self,
+        enabled: bool,
+        target_scales: Optional[Tuple[int, ...]] = None,
+        layer_id: Optional[str] = None,
+    ):
+        if enabled:
+            self.attn_capture_cfg = {
+                "enabled": True,
+                "target_scales": None
+                if target_scales is None
+                else tuple(target_scales),
+                "layer_id": layer_id,
+                "records": [],
+            }
+        else:
+            self.attn_capture_cfg = None
+
+    def pop_attn_capture_records(self):
+        if not self.attn_capture_cfg:
+            return []
+        records = list(self.attn_capture_cfg["records"])
+        self.attn_capture_cfg["records"].clear()
+        return records
+
+    def _get_relative_index_data(self, ph: int, pw: int, device: torch.device):
+        key = (ph, pw, device)
+        cached = self._relative_index_cache.get(key)
+        if cached is not None:
+            return cached
+        qh = (
+            torch.arange(ph, device=device, dtype=torch.long)[:, None]
+            .expand(ph, pw)
+            .reshape(-1)
+        )
+        qw = (
+            torch.arange(pw, device=device, dtype=torch.long)[None, :]
+            .expand(ph, pw)
+            .reshape(-1)
+        )
+        dh = qh[None, :] - qh[:, None] + (ph - 1)
+        dw = qw[None, :] - qw[:, None] + (pw - 1)
+        rel_w = 2 * pw - 1
+        rel_idx = (dh * rel_w + dw).reshape(-1)
+        counts = (
+            torch.bincount(rel_idx, minlength=(2 * ph - 1) * rel_w)
+            .clamp_min(1)
+            .to(torch.float32)
+        )
+        self._relative_index_cache[key] = (rel_idx, counts)
+        return self._relative_index_cache[key]
+
+    def _compute_query_centered_relative_map(
+        self, attn_slice: torch.Tensor, ph: int, pw: int
+    ):
+        B, H, Lq, Lk = attn_slice.shape
+        assert Lq == ph * pw and Lk == ph * pw, (
+            f"Expected square current-scale attention of size {ph * pw}, got {Lq}x{Lk}"
+        )
+        rel_idx, counts = self._get_relative_index_data(ph, pw, attn_slice.device)
+        rel_bins = counts.numel()
+        out = torch.zeros(
+            B, H, rel_bins, device=attn_slice.device, dtype=attn_slice.dtype
+        )
+        out.scatter_add_(
+            2, rel_idx.view(1, 1, -1).expand(B, H, -1), attn_slice.reshape(B, H, -1)
+        )
+        out = out / counts.view(1, 1, -1).to(dtype=attn_slice.dtype)
+        return out.view(B, H, 2 * ph - 1, 2 * pw - 1)
 
     # NOTE: attn_bias_or_two_vector is None during inference
     def forward(
@@ -535,18 +654,62 @@ class SelfAttention(nn.Module):
                     attn_fn(q, k, v, scale=self.scale).transpose(1, 2).reshape(B, L, C)
                 )
             else:
-                oup = (
-                    slow_attn(
-                        query=q,
-                        key=k,
-                        value=v,
-                        scale=self.scale,
-                        attn_mask=attn_bias_or_two_vector,
-                        dropout_p=0,
+                capture_cfg = self.attn_capture_cfg
+                should_capture = (
+                    capture_cfg is not None
+                    and capture_cfg.get("enabled", False)
+                    and (
+                        capture_cfg["target_scales"] is None
+                        or scale_ind in capture_cfg["target_scales"]
                     )
-                    .transpose(1, 2)
-                    .reshape(B, L, C)
+                    and not isinstance(attn_bias_or_two_vector, tuple)
                 )
+                if should_capture:
+                    scores = torch.matmul(q, k.transpose(-2, -1))
+                    if self.scale is not None:
+                        scores = scores * self.scale
+                    if attn_bias_or_two_vector is not None:
+                        scores = scores + attn_bias_or_two_vector.to(dtype=scores.dtype)
+                    attn_weights = torch.softmax(scores, dim=-1)
+                    pt, ph, pw = scale_schedule[scale_ind]
+                    current_scale_len = pt * ph * pw
+                    current_scale_attn = attn_weights[..., -current_scale_len:]
+                    relative_map = self._compute_query_centered_relative_map(
+                        current_scale_attn, ph, pw
+                    )
+                    capture_cfg["records"].append(
+                        {
+                            "layer_id": capture_cfg.get("layer_id"),
+                            "scale_ind": scale_ind,
+                            "attn_mean": attn_weights.mean(dim=-2).detach().cpu(),
+                            "query_var": attn_weights.var(dim=-2, unbiased=False)
+                            .detach()
+                            .cpu(),
+                            "query_var_score": attn_weights.var(dim=-2, unbiased=False)
+                            .mean(dim=-1)
+                            .detach()
+                            .cpu(),
+                            "relative_map": relative_map.detach().cpu(),
+                        }
+                    )
+                    oup = (
+                        torch.matmul(attn_weights.to(dtype=v.dtype), v)
+                        .transpose(1, 2)
+                        .reshape(B, L, C)
+                    )
+                else:
+                    oup = (
+                        slow_attn(
+                            query=q,
+                            key=k,
+                            value=v,
+                            scale=self.scale,
+                            attn_mask=attn_bias_or_two_vector,
+                            dropout_p=0,
+                        )
+                        .transpose(1, 2)
+                        .reshape(B, L, C)
+                    )
             # oup: bf16
 
         return self.proj_drop(self.proj(oup))

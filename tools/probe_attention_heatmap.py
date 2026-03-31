@@ -107,7 +107,7 @@ def parse_args():
     )
     parser.add_argument(
         "--output_dir",
-        default="probe_outputs/attn_heatmaps",
+        default="probe_outputs/attn_heatmaps_heights",
         help="Directory to store PNGs",
     )
     parser.add_argument(
@@ -354,7 +354,7 @@ def main():
         patcher = SphericalRoPEInfinityPatcher(
             infinity,
             alpha_w=1.0,
-            alpha_h=0.0,
+            alpha_h=0.5,
             head_split_ratio=(
                 None if args.condition == "spherical_all" else args.head_split_ratio
             ),
