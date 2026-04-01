@@ -40,11 +40,11 @@ VAE_TYPE = 32
 os.makedirs(OUT_DIR, exist_ok=True)
 
 PROMPTS = [
-    "This is a panorama image. The photo shows a breathtaking snowy mountain summit at sunrise, with golden light illuminating the peaks and valleys stretching endlessly in all directions.",
-    "This is a panorama image. The photo shows a spectacular fireworks display exploding in the night sky above a modern city skyline, with glittering lights reflecting off a calm river and bridges connecting both banks.",
-    "This is a panorama image. The photo shows a tranquil tropical beach at sunset, with crystal-clear turquoise water, white sand, and palm trees.",
-    "This is a panorama image. The photo shows the interior of a grand cathedral with soaring gothic arches, stained glass windows casting colorful light on the stone floor.",
-    "This is a panorama image. The photo shows a quiet forest path in autumn, with golden and red leaves covering the ground.",
+    "This is a 360 degree panorama image. The photo shows a breathtaking snowy mountain summit at sunrise, with golden light illuminating the peaks and valleys stretching endlessly in all directions.",
+    "This is a 360 degree panorama image. The photo shows a modern city skyline at night, with glittering lights reflecting off a calm river and bridges connecting both banks.",
+    "This is a 360 degree panorama image. The photo shows a tranquil tropical beach at sunset, with crystal-clear turquoise water, white sand, and palm trees.",
+    "This is a 360 degree panorama image. The photo shows the interior of a grand cathedral with soaring gothic arches, stained glass windows casting colorful light on the stone floor.",
+    "This is a 360 degree panorama image. The photo shows a quiet forest path in autumn, with golden and red leaves covering the ground.",
 ]
 SEEDS = [0, 1234, 5536, 8650, 9902]
 

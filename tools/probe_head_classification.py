@@ -25,15 +25,23 @@ from tools.run_infinity import (
 
 
 DEFAULT_PROMPTS = [
-    "This is a 360 degree panorama image. The photo shows a breathtaking snowy mountain summit at sunrise, with golden light illuminating the peaks and valleys stretching endlessly in all directions.",
-    "This is a 360 degree panorama image. The photo shows a modern city skyline at night, with glittering lights reflecting off a calm river and bridges connecting both banks.",
-    "This is a 360 degree panorama image. The photo shows a tranquil tropical beach at sunset, with crystal-clear turquoise water, white sand, and palm trees.",
-    "This is a 360 degree panorama image. The photo shows the interior of a grand cathedral with soaring gothic arches, stained glass windows casting colorful light on the stone floor.",
-    "This is a 360 degree panorama image. The photo shows a quiet forest path in autumn, with golden and red leaves covering the ground.",
+    "This is a panorama image. The photo shows a breathtaking snowy mountain summit at sunrise, with golden light illuminating the peaks and valleys stretching endlessly in all directions.",
+    "This is a panorama image. The photo shows a modern city skyline at night, with glittering lights reflecting off a calm river and bridges connecting both banks.",
+    "This is a panorama image. The photo shows a tranquil tropical beach at sunset, with crystal-clear turquoise water, white sand, and palm trees.",
+    "This is a panorama image. The photo shows the interior of a grand cathedral with soaring gothic arches, stained glass windows casting colorful light on the stone floor.",
+    "This is a panorama image. The photo shows a quiet forest path in autumn, with golden and red leaves covering the ground.",
 ]
 
-DEFAULT_SEEDS = [1234, 5536, 8650, 9902, 0]
-# DEFAULT_SEEDS = [0, 1234, 5536, 8650, 9902]
+# DEFAULT_PROMPTS = [
+#     "This is a 360 degree panorama image. The photo shows a breathtaking snowy mountain summit at sunrise, with golden light illuminating the peaks and valleys stretching endlessly in all directions.",
+#     "This is a 360 degree panorama image. The photo shows a modern city skyline at night, with glittering lights reflecting off a calm river and bridges connecting both banks.",
+#     "This is a 360 degree panorama image. The photo shows a tranquil tropical beach at sunset, with crystal-clear turquoise water, white sand, and palm trees.",
+#     "This is a 360 degree panorama image. The photo shows the interior of a grand cathedral with soaring gothic arches, stained glass windows casting colorful light on the stone floor.",
+#     "This is a 360 degree panorama image. The photo shows a quiet forest path in autumn, with golden and red leaves covering the ground.",
+# ]
+
+# DEFAULT_SEEDS = [1234, 5536, 8650, 9902, 0]
+DEFAULT_SEEDS = [0, 1234, 5536, 8650, 9902]
 
 
 def parse_args():
@@ -364,10 +372,12 @@ def slugify(text: str, max_len: int = 48) -> str:
 
 def save_heatmap_set(layer_maps, root_dir: Path, scale_idx: int, scale_span, scale_hw):
     root_dir.mkdir(parents=True, exist_ok=True)
+    layers_root = root_dir / "layers"
+    layers_root.mkdir(parents=True, exist_ok=True)
     start, end = scale_span
     final_h, final_w = scale_hw
     for layer_id in sorted(layer_maps.keys()):
-        layer_dir = root_dir / layer_id / f"scale{scale_idx:02d}"
+        layer_dir = layers_root / layer_id / f"scale{scale_idx:02d}"
         layer_dir.mkdir(parents=True, exist_ok=True)
         mean_arr = layer_maps[layer_id]["attn_mean"]
         var_arr = layer_maps[layer_id]["query_var"]
@@ -385,7 +395,8 @@ def save_heatmap_set(layer_maps, root_dir: Path, scale_idx: int, scale_span, sca
 
 def build_layer_grids(root_dir: Path, scale_idx: int):
     scale_name = f"scale{scale_idx:02d}"
-    sample_dir = root_dir / "L00" / scale_name
+    layers_root = root_dir / "layers"
+    sample_dir = layers_root / "L00" / scale_name
     if not sample_dir.exists():
         return
     image_names = sorted(
@@ -394,7 +405,7 @@ def build_layer_grids(root_dir: Path, scale_idx: int):
     for image_name in image_names:
         inputs = []
         for layer_idx in range(32):
-            image_path = root_dir / f"L{layer_idx:02d}" / scale_name / image_name
+            image_path = layers_root / f"L{layer_idx:02d}" / scale_name / image_name
             if not image_path.exists():
                 inputs = []
                 break
@@ -420,7 +431,8 @@ def build_layer_grids(root_dir: Path, scale_idx: int):
 
 def build_head_grids(root_dir: Path, scale_idx: int):
     scale_name = f"scale{scale_idx:02d}"
-    for layer_dir in sorted(root_dir.glob("L*")):
+    layers_root = root_dir / "layers"
+    for layer_dir in sorted(layers_root.glob("L*")):
         scale_dir = layer_dir / scale_name
         if not scale_dir.exists():
             continue
@@ -451,6 +463,44 @@ def build_head_grids(root_dir: Path, scale_idx: int):
             )
 
 
+def build_layer_head_summary_grids(root_dir: Path, scale_idx: int):
+    scale_name = f"scale{scale_idx:02d}"
+    layers_root = root_dir / "layers"
+    sample_layer = layers_root / "L00" / scale_name
+    if not sample_layer.exists():
+        return
+    for suffix in ("attn_mean", "query_var", "relative"):
+        inputs = []
+        for layer_idx in range(32):
+            image_path = (
+                layers_root
+                / f"L{layer_idx:02d}"
+                / scale_name
+                / f"head_{suffix}_grid_4x4.png"
+            )
+            if not image_path.exists():
+                inputs = []
+                break
+            inputs.append(str(image_path))
+        if not inputs:
+            continue
+        out_path = root_dir / f"head_{suffix}_layer_grids_4x8.png"
+        subprocess.run(
+            [
+                "montage",
+                *inputs,
+                "-tile",
+                "4x8",
+                "-geometry",
+                "+6+6",
+                "-background",
+                "white",
+                str(out_path),
+            ],
+            check=True,
+        )
+
+
 def save_generated_image(path: Path, img):
     if isinstance(img, torch.Tensor):
         arr = img.detach().cpu().numpy()
@@ -474,7 +524,8 @@ def get_image_size(path: Path):
 
 def build_generated_composites(root_dir: Path, generated_path: Path):
     grid_paths = sorted(root_dir.glob("*_layers_grid_4x8.png"))
-    grid_paths.extend(sorted(root_dir.glob("L*/scale*/*_grid_4x4.png")))
+    grid_paths.extend(sorted(root_dir.glob("*_layer_grids_4x8.png")))
+    grid_paths.extend(sorted((root_dir / "layers").glob("L*/scale*/*_grid_4x4.png")))
     for grid_path in grid_paths:
         out_path = grid_path.with_name(f"{grid_path.stem}_with_generated.png")
         grid_w, _ = get_image_size(grid_path)
@@ -601,6 +652,7 @@ def main():
                 )
                 build_layer_grids(per_prompt_root, final_scale_idx)
                 build_head_grids(per_prompt_root, final_scale_idx)
+                build_layer_head_summary_grids(per_prompt_root, final_scale_idx)
                 build_generated_composites(
                     per_prompt_root, per_prompt_root / "generated.png"
                 )
@@ -693,6 +745,7 @@ def main():
         )
         build_layer_grids(aggregate_root, final_scale_idx)
         build_head_grids(aggregate_root, final_scale_idx)
+        build_layer_head_summary_grids(aggregate_root, final_scale_idx)
         print(f"Saved heatmaps to {heatmap_root}")
 
 
